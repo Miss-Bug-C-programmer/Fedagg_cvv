@@ -1,19 +1,106 @@
 import numpy as np
-import torch
 from PIL import Image
 from matplotlib import pyplot as plt
 from torchvision.utils import save_image
 import torchvision.transforms as transforms
-import numpy as np
-from autoencoder_pretrained import create_autoencoder
-from utils import KL_Loss,CE_Loss
-from torch import nn
 import utils
+import torch
+from cache_system import CacheLayer, CacheObject
+from utils import accuracy
+from autoencoder_pretrained import create_autoencoder
+from torch import nn
+from utils import KL_Loss, CE_Loss
 
+# === 新增 ===
+from dataclasses import dataclass, field
+from typing import List, Dict, Any
+
+# === 新增：指标容器 ===
+@dataclass
+class FedAggMetrics:
+    acc_list: List[float] = field(default_factory=list)
+    consistency_list: List[float] = field(default_factory=list)
+    comm_cost_cloud_MB: List[float] = field(default_factory=list)
+    comm_cost_edges_MB: List[float] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "acc_list": self.acc_list,
+            "consistency_list": self.consistency_list,
+            "comm_cost_cloud_MB": self.comm_cost_cloud_MB,
+            "comm_cost_edges_MB": self.comm_cost_edges_MB,
+        }
+
+# === 新增：估算模型尺寸（MB）用于通信量近似 ===
+def model_size_mb(model: torch.nn.Module) -> float:
+    total_params = 0
+    for p in model.parameters():
+        total_params += p.numel()
+    return total_params * 4.0 / (1024.0 * 1024.0)
+
+# === 新增：Top-1 准确率（云端模型在测试集）===
+@torch.no_grad()
+def eval_top1_acc(model: torch.nn.Module, test_loader, device: torch.device) -> float:
+    model.eval()
+    correct, total = 0, 0
+    for x, y in test_loader:
+        x = x.to(device)
+        y = torch.as_tensor(y, dtype=torch.long, device=device)
+        out = model(x)
+        if isinstance(out, tuple):
+            out = out[0]
+        pred = out.argmax(dim=1)
+        correct += (pred == y).sum().item()
+        total += y.numel()
+    return correct / max(1, total)
+
+# === 新增：一致性（边-云 logits 差异；越接近 1 越一致）===
+@torch.no_grad()
+def compute_consistency_logits(cloud_model: torch.nn.Module,
+                               edge_models: List[torch.nn.Module],
+                               test_loader,
+                               device: torch.device,
+                               max_batches: int = 1) -> float:
+    """
+    使用测试数据前 max_batches 个 batch，在云与各边模型上前向，
+    计算 logits 的平均 L2 距离，再映射为 1/(1+avg_l2)。
+    """
+    if not edge_models:
+        return 1.0
+    cloud_model.eval()
+    for m in edge_models:
+        m.eval()
+
+    batch_cnt = 0
+    dists = []
+    for x, _ in test_loader:
+        x = x.to(device)
+        out_c = cloud_model(x)
+        if isinstance(out_c, tuple):
+            out_c = out_c[0]
+        out_c = out_c.detach().float()
+
+        for em in edge_models:
+            out_e = em(x)
+            if isinstance(out_e, tuple):
+                out_e = out_e[0]
+            out_e = out_e.detach().float()
+            # 平均每样本的 L2
+            l2 = torch.linalg.vector_norm(out_c - out_e, dim=1).mean().item()
+            dists.append(l2)
+
+        batch_cnt += 1
+        if batch_cnt >= max_batches:
+            break
+
+    if len(dists) == 0:
+        return 1.0
+    avg_l2 = float(sum(dists) / len(dists))
+    return 1.0 / (1.0 + avg_l2)
 
 
 def test_on_cloud(cloud_model,test_data_global,comm_round):
-    acc_all=[]        
+    acc_all=[]
     if True:
         loss_avg = utils.RunningAverage()
         accTop1_avg = utils.RunningAverage()
@@ -31,18 +118,108 @@ def test_on_cloud(cloud_model,test_data_global,comm_round):
                         }
         print("Test/AccTop1 in comm_round",comm_round,test_metrics['test_accTop1'])
 
-def run_fedagg(client_models,edge_models,cloud_model,train_data_local_num_dict, test_data_local_num_dict,train_data_local_dict, test_data_local_dict, test_data_global, args):
-    V1=[Node(args,cloud_model)]
-    V2=create_child_for_upper_level(args,V1,args.edge_number,edge_models)
-    assert args.client_number%args.edge_number==0
-    V3=create_child_for_upper_level(args,V2,args.client_number//args.edge_number,client_models)
-    for idx,node in enumerate(V3):
-        node.dataset=[_ for _ in train_data_local_dict[idx]]
-    Init(V1[0])
-    for comm_round in range(args.comm_round):
-        train_FedAgg(V1[0],args)
-        test_on_cloud(V1[0].model,test_data_global,comm_round)
 
+def run_fedagg(client_models, edge_models, cloud_model,
+               train_data_local_num_dict, test_data_local_num_dict,
+               train_data_local_dict, test_data_local_dict,
+               test_data_global, args):
+
+    # === 初始化缓存层 ===
+    cloud_cache = CacheLayer("cloud")
+    edge_caches = [CacheLayer(f"edge_{i}") for i in range(args.edge_number)]
+    end_caches = [CacheLayer(f"end_{i}") for i in range(args.client_number)]
+
+    metrics = {
+        "acc_list": [],
+        "consistency_list": [],
+        "comm_cost_cloud_MB": [],
+        "comm_cost_edges_MB": [],
+        "chr_cloud": [],
+        "chr_edges": [],
+        "chr_ends": []
+    }
+
+    # === 初始化 CVV 参数 ===
+    sync_strategy = getattr(args, "sync_strategy", "full")
+    T_sync = getattr(args, "T_sync", 1)
+    delta_v = getattr(args, "delta_v", 0)
+
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+    for r in range(args.comm_round):
+        # === 原有训练聚合逻辑 ===
+        # train_FedAgg(...)
+        # 每轮更新 end_caches
+        for end_idx, model in enumerate(client_models):
+            obj = CacheObject(data=model.state_dict(),
+                              version=r,
+                              obj_type="model",
+                              source=f"end_{end_idx}")
+            end_caches[end_idx].put("model", obj)
+
+        # 端→边 差量同步
+        for e_idx in range(args.edge_number):
+            for end_id in range(e_idx*(args.client_number//args.edge_number),
+                                (e_idx+1)*(args.client_number//args.edge_number)):
+                edge_caches[e_idx].diff_and_update(end_caches[end_id],
+                                                   strategy=sync_strategy,
+                                                   delta_v=delta_v)
+
+        # 边→云 差量同步
+        for e_idx in range(args.edge_number):
+            cloud_cache.diff_and_update(edge_caches[e_idx],
+                                        strategy=sync_strategy,
+                                        delta_v=delta_v)
+
+        # === 记录指标 ===
+        # 计算云端模型精度
+        acc_val = eval_top1_acc(cloud_model, test_data_global, device)
+        metrics["acc_list"].append(acc_val)
+        # 一致性 (简化为云-边参数版本一致率)
+        cons_val = consistency_version(cloud_cache, edge_caches)
+        metrics["consistency_list"].append(cons_val)
+        # 通信开销
+        metrics["comm_cost_cloud_MB"].append(cloud_cache.comm_cost_MB)
+        metrics["comm_cost_edges_MB"].append(sum([ec.comm_cost_MB for ec in edge_caches]))
+        # 命中率
+        chr_c, _ = cloud_cache.get_metrics(total_requests=len(edge_caches))
+        metrics["chr_cloud"].append(chr_c)
+        metrics["chr_edges"].append(sum([ec.get_metrics(1)[0] for ec in edge_caches]) / args.edge_number)
+        metrics["chr_ends"].append(sum([ec.get_metrics(1)[0] for ec in end_caches]) / args.client_number)
+
+        # 重置本轮通信统计
+        cloud_cache.reset_metrics()
+        for ec in edge_caches: ec.reset_metrics()
+# === 新增：返回字典，供上层写 CSV ===
+    return metrics
+
+@torch.no_grad()
+def eval_top1_acc(model, test_loader, device):
+    model.eval()
+    correct, total = 0, 0
+    for x, y in test_loader:
+        x = x.to(device)
+        y = torch.as_tensor(y, dtype=torch.long, device=device)
+        out = model(x)
+        if isinstance(out, tuple): out = out[0]
+        pred = torch.argmax(out, dim=1)
+        correct += (pred == y).sum().item()
+        total += y.numel()
+    return correct / max(total, 1)
+
+
+def consistency_version(cloud_cache, edge_caches):
+    """
+    一致性度量：云端与各边节点相同key的版本号一致率
+    """
+    total_keys = 0
+    match_keys = 0
+    for ec in edge_caches:
+        for key, ver in ec.version_vector.items():
+            total_keys += 1
+            if cloud_cache.version_vector.get(key, None) == ver:
+                match_keys += 1
+    return match_keys / max(total_keys, 1)
 
 global_index=0
 class Node:
