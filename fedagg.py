@@ -57,16 +57,26 @@ def eval_top1_acc(model: torch.nn.Module, test_loader, device: torch.device) -> 
 # === 新增：一致性（边-云 logits 差异；越接近 1 越一致）===
 @torch.no_grad()
 def compute_consistency_logits(cloud_model: torch.nn.Module,
-                               edge_models: List[torch.nn.Module],
+                               edge_models: list,
                                test_loader,
                                device: torch.device,
                                max_batches: int = 1) -> float:
     """
-    使用测试数据前 max_batches 个 batch，在云与各边模型上前向，
-    计算 logits 的平均 L2 距离，再映射为 1/(1+avg_l2)。
+    使用测试数据前 max_batches 个 batch 进行云-边 logits 差异一致性度量。
+    修正点：在评估前将云、边模型统一迁移到相同 device，避免 CPU/GPU 混用。
+    返回值越接近 1 一致性越好。
     """
     if not edge_models:
         return 1.0
+
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # 统一设备
+    cloud_model = cloud_model.to(device)
+    for m in edge_models:
+        m.to(device)
+
     cloud_model.eval()
     for m in edge_models:
         m.eval()
@@ -74,7 +84,7 @@ def compute_consistency_logits(cloud_model: torch.nn.Module,
     batch_cnt = 0
     dists = []
     for x, _ in test_loader:
-        x = x.to(device)
+        x = x.to(device, non_blocking=True)
         out_c = cloud_model(x)
         if isinstance(out_c, tuple):
             out_c = out_c[0]
@@ -85,7 +95,7 @@ def compute_consistency_logits(cloud_model: torch.nn.Module,
             if isinstance(out_e, tuple):
                 out_e = out_e[0]
             out_e = out_e.detach().float()
-            # 平均每样本的 L2
+            # 每样本 L2 后取均值
             l2 = torch.linalg.vector_norm(out_c - out_e, dim=1).mean().item()
             dists.append(l2)
 
@@ -124,6 +134,8 @@ def run_fedagg(client_models, edge_models, cloud_model,
                train_data_local_dict, test_data_local_dict,
                test_data_global, args):
 
+    V1=[Node(args,cloud_model)]
+    V2=create_child_for_upper_level(args,V1,args.edge_number,edge_models)
     # === 初始化缓存层 ===
     cloud_cache = CacheLayer("cloud")
     edge_caches = [CacheLayer(f"edge_{i}") for i in range(args.edge_number)]
@@ -148,7 +160,8 @@ def run_fedagg(client_models, edge_models, cloud_model,
 
     for r in range(args.comm_round):
         # === 原有训练聚合逻辑 ===
-        # train_FedAgg(...)
+        train_FedAgg(V1[0],args)
+        test_on_cloud(V1[0].model,test_data_global,r)
         # 每轮更新 end_caches
         for end_idx, model in enumerate(client_models):
             obj = CacheObject(data=model.state_dict(),
@@ -173,10 +186,11 @@ def run_fedagg(client_models, edge_models, cloud_model,
 
         # === 记录指标 ===
         # 计算云端模型精度
-        acc_val = eval_top1_acc(cloud_model, test_data_global, device)
+        acc_val = eval_top1_acc(V1[0].model, test_data_global, device)
         metrics["acc_list"].append(acc_val)
         # 一致性 (简化为云-边参数版本一致率)
-        cons_val = consistency_version(cloud_cache, edge_caches)
+        #cons_val = consistency_version(cloud_cache, edge_caches)
+        cons_val = compute_consistency_logits(V1[0].model, edge_models_rt, test_data_global, device, max_batches=1)
         metrics["consistency_list"].append(cons_val)
         # 通信开销
         metrics["comm_cost_cloud_MB"].append(cloud_cache.comm_cost_MB)
@@ -187,6 +201,8 @@ def run_fedagg(client_models, edge_models, cloud_model,
         metrics["chr_edges"].append(sum([ec.get_metrics(1)[0] for ec in edge_caches]) / args.edge_number)
         metrics["chr_ends"].append(sum([ec.get_metrics(1)[0] for ec in end_caches]) / args.client_number)
 
+        print("round:", r, " acc:", acc_val, " consistency:", cons_val, " comm_cost_cloud_MB:", cloud_cache.comm_cost_MB, " comm_cost_edges_MB:", sum([ec.comm_cost_MB for ec in edge_caches]), " total_cache:", cloud_cache.comm_cost_MB+sum([ec.comm_cost_MB for ec in edge_caches]), " chr_cloud:", chr_c, " chr_edges:", sum([ec.get_metrics(1)[0] for ec in edge_caches]) / args.edge_number, " chr_ends:", sum([ec.get_metrics(1)[0] for ec in end_caches]) / args.client_number)
+
         # 重置本轮通信统计
         cloud_cache.reset_metrics()
         for ec in edge_caches: ec.reset_metrics()
@@ -194,18 +210,29 @@ def run_fedagg(client_models, edge_models, cloud_model,
     return metrics
 
 @torch.no_grad()
-def eval_top1_acc(model, test_loader, device):
+def eval_top1_acc(model: torch.nn.Module, test_loader, device: torch.device) -> float:
+    """
+    评估前，将模型移动到 device；将每个 batch 的数据也移动到相同 device。
+    不依赖外部状态，避免 CPU/GPU 混用导致的 conv 错误。
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # 确保模型在 device 上
+    model = model.to(device)
     model.eval()
+
     correct, total = 0, 0
     for x, y in test_loader:
-        x = x.to(device)
+        x = x.to(device, non_blocking=True)
         y = torch.as_tensor(y, dtype=torch.long, device=device)
         out = model(x)
-        if isinstance(out, tuple): out = out[0]
-        pred = torch.argmax(out, dim=1)
+        if isinstance(out, tuple):
+            out = out[0]
+        pred = out.argmax(dim=1)
         correct += (pred == y).sum().item()
         total += y.numel()
-    return correct / max(total, 1)
+    return correct / max(1, total)
 
 
 def consistency_version(cloud_cache, edge_caches):
@@ -324,6 +351,8 @@ class Loss_Leaf(nn.Module):
 def BSBODP_dir(node_origin,node_neigh,args):
     noises=node_neigh.noises if len(node_neigh.noises)<len(node_origin.noises) else node_origin.noises
     labels=node_neigh.labels if len(node_neigh.labels)<len(node_origin.labels) else node_origin.labels
+    # 安全获取温度参数，避免 args 无 T_agg 报错
+    temp = getattr(args, "T_agg", 3.0)
     crit_non_leaf=Loss_Non_Leaf(args.T_agg)
     crit_leaf=Loss_Leaf(args.T_agg)
     optimizer = torch.optim.SGD(node_origin.model.parameters(), lr=node_origin.args.lr, momentum=0.9)
